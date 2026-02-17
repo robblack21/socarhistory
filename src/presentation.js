@@ -830,12 +830,12 @@ export class PresentationController {
                     let specializedStyle = "color: rgba(255,255,255,0.6);";
                     if (isCurrent) {
                         specializedStyle = `
-                            text-shadow: 0 0 10px rgba(255, 255, 255, 0.4); 
+                            text-shadow: 0 0 10px rgba(0,0,0,0.8), 0 0 20px rgba(0,0,0,0.6), 0 0 5px rgba(255,255,255,0.8);
                             color: #ffffff; 
                             font-size: 1.1em; 
-                            font-weight: 500;
+                            font-weight: 600;
                             margin: 0 4px; 
-                            transform: scale(1.02);
+                            transform: scale(1.05);
                         `;
                     }
                     

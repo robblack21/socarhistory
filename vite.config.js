@@ -1,4 +1,7 @@
 
 export default {
-    base: './', // Use relative paths for assets
+    base: '/socarhistory/', // Explicit base for GitHub Pages compatibility in dev
+    optimizeDeps: {
+        exclude: ['@sparkjsdev/spark']
+    },
 }
