@@ -199,3 +199,43 @@ export function updateRemoteSegmentation(remoteVideo) {
          }
     });
 }
+
+// Camera Management
+export async function listVideoDevices() {
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices.filter(device => device.kind === 'videoinput');
+    } catch(e) {
+        console.error("Error listing devices", e);
+        return [];
+    }
+}
+
+export async function setVideoSource(deviceId) {
+    const video = document.getElementById('webcam');
+    if (!video) return;
+    
+    // Stop existing stream
+    if (video.srcObject) {
+        video.srcObject.getTracks().forEach(track => track.stop());
+    }
+    
+    const constraints = {
+        video: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+        }
+    };
+    
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+        console.log(`Camera switched to ${deviceId || 'default'}`);
+        return true;
+    } catch(e) {
+        console.error("Error switching camera", e);
+        return false;
+    }
+}

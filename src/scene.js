@@ -40,6 +40,7 @@ export async function initScene(loadDefaultAssets = true) {
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 0); // Transparent background
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap; 
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -88,6 +89,8 @@ async function loadAssets() {
 
     // 1. Office Background (Apple Sharp Extrusion)
     try {
+    // 1. Office Background (Apple Sharp Extrusion)
+    try {
         const splatData = await splatLoader.loadAsync(`${baseUrl}assets/office.ply`);
         officeSplat = new SplatMesh({ packedSplats: splatData });
         scene.add(officeSplat);
@@ -110,6 +113,7 @@ async function loadAssets() {
 
         console.log("Office Splat Loaded");
     } catch (e) { console.error("Failed to load office.ply", e); }
+    } catch (e) { console.error("Failed to load debug splat", e); }
 
     // 2. GLB Assets
     const loadGLB = async (name) => {

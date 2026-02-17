@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SplatLoader, SplatMesh } from '@sparkjsdev/spark'; 
 import { slides } from './presentation_data.js';
-import { trackingState } from './vision.js';
+import { trackingState, listVideoDevices, setVideoSource } from './vision.js';
 
 export class PresentationController {
     constructor(scene, camera, renderer) {
@@ -15,11 +15,17 @@ export class PresentationController {
         this.camera.add(this.listener);
         this.audioContext = this.listener.context; 
         
+        // Audio Loading (Preload)
+        this.bgMusic = new THREE.Audio(this.listener);
+        this.narration = new THREE.Audio(this.listener);
+        this.initAudio(); // Start loading immediately
+        
         this.currentSlideIndex = -1;
         this.slideStartTime = 0;
         this.isPlaying = false;
         this.manualRotation = false; 
-        this.enableAssetAnim = true; // Default Enabled
+        this.enableAssetAnim = true; 
+        this.enableHeadTracking = true; // Default ON
         
         this.loaders = {
             gltf: new GLTFLoader(),
@@ -30,11 +36,9 @@ export class PresentationController {
         this.assets = {}; 
         this.currentObject = null;
         
-        this.bgMusic = null;
-        this.narration = null;
-        
         this.ui = {};
         this.initUI();
+        this.initSettingsUI(); // New Settings UI
         this.initControls(); 
         this.initDebugUI();  
         
@@ -43,10 +47,343 @@ export class PresentationController {
         this.wordIndex = 0;
         this.subtitleInterval = null;
 
-        // Head Tracking State for Smoothing
+        // Head Tracking State
         this.currentTrackingOffset = new THREE.Vector3();
+        this.lastTrackingOffset = new THREE.Vector3();
+        this.lastTrackingQuat = new THREE.Quaternion();
+        
+        this.narrationData = null; 
+        this.loadNarration();
     }
     
+    async loadNarration() {
+        try {
+            const response = await fetch('assets/narration.json');
+            this.narrationData = await response.json();
+            console.log("Narration Loaded", this.narrationData);
+            this.syncSlides();
+        } catch(e) {
+            console.error("Failed to load narration.json", e);
+        }
+    }
+
+    syncSlides() {
+        if (!this.narrationData) return;
+        
+        const normalize = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const allWords = [];
+        this.narrationData.segments.forEach(seg => {
+             if (seg.words) allWords.push(...seg.words);
+        });
+        
+        
+        console.log(`Syncing ${slides.length} slides against ${allWords.length} words...`);
+
+        // OFFSET CORRECTION: The audio file has a ~12s silence/intro.
+        // We offset all narration data by 8s so that the 4s mark in audio aligns with T=12.
+        const offset = 8.0;
+        this.narrationData.segments.forEach(seg => {
+             if (seg.start_time) seg.start_time += offset;
+             if (seg.end_time) seg.end_time += offset;
+             if (seg.words) seg.words.forEach(w => {
+                 w.start_time += offset;
+                 w.end_time += offset;
+             });
+        });
+
+        // Re-populate allWords with offset values
+        const offsetWords = [];     
+        this.narrationData.segments.forEach(seg => {
+             if (seg.words) offsetWords.push(...seg.words);
+        });
+        
+        slides.forEach(slide => {
+             // If startTime is already hardcoded (manual override based on user feedback), skip fuzzy
+             if (slide.startTime !== undefined) {
+                 console.log(`Using hardcoded time for "${slide.year}": ${slide.startTime}s`);
+                 return;
+             }
+             
+             // Fuzzy Logic Fallback
+             const searchWords = slide.text.split(' ').slice(0, 4).join(' '); 
+             const searchNorm = normalize(searchWords);
+             
+             for (let i = 0; i < offsetWords.length - 3; i++) {
+                 let windowText = "";
+                 for(let j=0; j<6; j++) { 
+                     if(i+j < offsetWords.length) windowText += offsetWords[i+j].text + " ";
+                 }
+                 const windowNorm = normalize(windowText);
+                 
+                 if (windowNorm.includes(searchNorm)) {
+                     slide.startTime = offsetWords[i].start_time;
+                     console.log(`Matched "${slide.year}" to ${slide.startTime}s`);
+                     break; 
+                 }
+             }
+        });
+        
+        // Fallback for first slide -> 0
+        if (slides[0] && !slides[0].startTime) slides[0].startTime = 0;
+        
+        // Sort slides by startTime
+        slides.sort((a,b) => (a.startTime || 9999) - (b.startTime || 9999));
+        
+        // Calc durations based on next slide
+        for (let i = 0; i < slides.length; i++) {
+             if (i < slides.length - 1) {
+                 const nextStart = slides[i+1].startTime;
+                 if (nextStart !== undefined && slides[i].startTime !== undefined) {
+                     slides[i].duration = nextStart - slides[i].startTime;
+                 }
+             } 
+             // Keep manual duration if last slide or calc failed
+        }
+        
+        console.log("Slides Synced & Sorted", slides);
+        
+        // ---------------------------------------------------------
+        // CRITICAL FIX: RE-INIT OR UPDATE UI AFTER SORTING
+        // Because "slides" array is mutated and sorted in place,
+        // any index-based reference might be stale if initUI ran before.
+        // But initUI runs *before* this sync. 
+        // We need to REBUILD specific UI parts that depend on slide order.
+        // ---------------------------------------------------------
+        // Refresh Timeline UI if it exists
+        if (this.ui.timelineDots) {
+            // Re-render timeline (simplified: just reload UI or update dots? 
+            // Better to re-init timeline dots in update if changed, 
+            // or just clear and rebuild here if UI is ready.
+            // Let's modify initUI to be callable or just update positions.
+            // For now, let's rely on the fact that initUI runs ONCE. 
+            // If we sort slides, we need to rebuild the timeline.
+            const timelineEl = this.ui.timelineDots[0]?.parentNode; // HACK to get parent
+            if (timelineEl) {
+                // Clear dots
+                this.ui.timelineDots.forEach(d => timelineEl.removeChild(d.container));
+                this.ui.timelineDots = [];
+                
+                // Rebuild
+                const yearSlides = slides.filter(s => s.year);
+                const segmentWidth = 100 / (yearSlides.length - 1);
+                let visualIdx = 0;
+                
+                slides.forEach((slide, idx) => {
+                    if (!slide.year) return; 
+                    const container = document.createElement('div');
+                    container.style.position = 'absolute';
+                    container.style.left = `${visualIdx * segmentWidth}%`;
+                    container.style.transform = 'translateX(-50%)';
+                    container.style.display = 'flex';
+                    container.style.flexDirection = 'column';
+                    container.style.alignItems = 'center';
+                    container.style.cursor = 'pointer';
+                    
+                    const tick = document.createElement('div');
+                    tick.style.width = '2px';
+                    tick.style.height = '10px';
+                    tick.style.backgroundColor = 'white';
+                    tick.style.marginBottom = '5px';
+                    container.appendChild(tick);
+                    
+                    const label = document.createElement('div');
+                    label.innerText = slide.year;
+                    label.style.color = 'rgba(255,255,255,0.7)';
+                    label.style.fontSize = '12px';
+                    label.style.fontFamily = 'monospace';
+                    label.style.transition = 'transform 0.3s, color 0.3s';
+                    container.appendChild(label);
+                    
+                    container.onclick = () => {
+                         // Seek logic needs update for Audio Time
+                         if (this.narration && slide.startTime !== undefined) {
+                             this.narration.stop();
+                             this.narration.offset = slide.startTime;
+                             this.narration.play();
+                             
+                             // Also need to sync music? No, loop is independent.
+                             
+                             // Force Slide Jump
+                             this.jumpToSlide(idx); 
+                         }
+                    };
+                    
+                    timelineEl.appendChild(container); // Add back to parent
+                    this.ui.timelineDots.push({ index: idx, label, container });
+                    visualIdx++;
+                });
+            }
+        }
+    }
+
+    async initSettingsUI() {
+        // Settings Icon (Gear) - Top Left
+        const settingsBtn = document.createElement('div');
+        settingsBtn.style.position = 'absolute';
+        settingsBtn.style.top = '20px';
+        settingsBtn.style.left = '60px'; // Next to Pause (20px) + Gap
+        settingsBtn.style.width = '24px';
+        settingsBtn.style.height = '24px';
+        settingsBtn.style.cursor = 'pointer';
+        settingsBtn.style.zIndex = '2001';
+        
+        const gearSvg = `<svg viewBox="0 0 24 24" fill="white"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.06-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.73,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.06,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>`;
+        settingsBtn.innerHTML = gearSvg;
+        settingsBtn.onclick = () => {
+             const display = this.ui.settingsPanel.style.display;
+             this.ui.settingsPanel.style.display = (display === 'none') ? 'block' : 'none';
+        }
+        document.body.appendChild(settingsBtn);
+        this.ui.settingsBtn = settingsBtn;
+
+        // Settings Panel
+        const panel = document.createElement('div');
+        panel.style.position = 'absolute';
+        panel.style.top = '60px';
+        panel.style.left = '20px';
+        panel.style.width = '280px';
+        panel.style.backgroundColor = 'rgba(0,0,0,0.9)';
+        panel.style.border = '1px solid #444';
+        panel.style.borderRadius = '8px';
+        panel.style.padding = '15px';
+        panel.style.color = 'white';
+        panel.style.fontFamily = 'sans-serif';
+        panel.style.fontSize = '14px';
+        panel.style.display = 'none'; // Hidden by default
+        panel.style.zIndex = '2002';
+        
+        // 1. Camera Source
+        const camLabel = document.createElement('div');
+        camLabel.textContent = "Camera Source";
+        camLabel.style.marginBottom = '5px';
+        camLabel.style.fontWeight = 'bold';
+        panel.appendChild(camLabel);
+        
+        const camSelect = document.createElement('select');
+        camSelect.style.width = '100%';
+        camSelect.style.marginBottom = '15px';
+        camSelect.style.padding = '5px';
+        camSelect.style.backgroundColor = '#222';
+        camSelect.style.color = 'white';
+        camSelect.style.border = '1px solid #555';
+        
+
+        // Populate Cameras
+        const refreshCameras = async () => {
+            // Keep selected value if possible
+            const currentVal = camSelect.value;
+            camSelect.innerHTML = '';
+            const devices = await listVideoDevices();
+            devices.forEach(d => {
+                const opt = document.createElement('option');
+                opt.value = d.deviceId;
+                opt.textContent = d.label || `Camera ${d.deviceId.substr(0,4)}...`;
+                camSelect.appendChild(opt);
+            });
+            if (currentVal) camSelect.value = currentVal;
+        };
+        
+        settingsBtn.onclick = () => {
+             const display = this.ui.settingsPanel.style.display;
+             const isHidden = (display === 'none');
+             this.ui.settingsPanel.style.display = isHidden ? 'block' : 'none';
+             if (isHidden) refreshCameras();
+        }
+
+        // ... inside Settings Panel ...
+        // (We need to update the onclick handler we just defined above, or just redefine refreshCameras at broader scope?
+        // Actually, initSettingsUI is one big function. I can just update the code block.)
+        
+        // 2. Music Volume
+        const musicLabel = document.createElement('div');
+        musicLabel.textContent = "Music Volume";
+        musicLabel.style.marginBottom = '5px';
+        musicLabel.style.fontWeight = 'bold';
+        panel.appendChild(musicLabel);
+        
+        const musicSlider = document.createElement('input');
+        musicSlider.type = 'range';
+        musicSlider.min = '0';
+        musicSlider.max = '1';
+        musicSlider.step = '0.1';
+        this.musicVolume = 0.3; // Default
+        musicSlider.value = this.musicVolume;
+        musicSlider.style.width = '100%';
+        musicSlider.style.marginBottom = '15px';
+        musicSlider.oninput = (e) => {
+            const val = parseFloat(e.target.value);
+            if (!isFinite(val)) return; // prevent NaN
+            this.musicVolume = val;
+            if (this.bgMusic) this.bgMusic.setVolume(this.musicVolume);
+            if (this.isMuted && this.musicVolume > 0) this.toggleMute(); // Unmute if sliding
+        };
+        panel.appendChild(musicSlider);
+        this.ui.musicSlider = musicSlider; // Store ref
+        
+        // 3. Narration Volume
+        const narrLabel = document.createElement('div');
+        narrLabel.textContent = "Narration Volume";
+        narrLabel.style.marginBottom = '5px';
+        narrLabel.style.fontWeight = 'bold';
+        panel.appendChild(narrLabel);
+        
+        const narrSlider = document.createElement('input');
+        narrSlider.type = 'range';
+        narrSlider.min = '0';
+        narrSlider.max = '1';
+        narrSlider.step = '0.1';
+        this.narrationVolume = 1.0; // Default
+        narrSlider.value = this.narrationVolume;
+        narrSlider.style.width = '100%';
+        narrSlider.style.marginBottom = '15px';
+        narrSlider.oninput = (e) => {
+            const val = parseFloat(e.target.value);
+            if (!isFinite(val)) return; // prevent NaN
+            this.narrationVolume = val;
+            if (this.narration) this.narration.setVolume(this.narrationVolume);
+            if (this.isMuted && this.narrationVolume > 0) this.toggleMute(); // Unmute
+        };
+        panel.appendChild(narrSlider);
+        this.ui.narrSlider = narrSlider; // Store ref
+
+
+        // Close Button
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = 'Close';
+        closeBtn.style.padding = '5px 10px';
+        closeBtn.style.backgroundColor = '#444';
+        closeBtn.style.color = 'white';
+        closeBtn.style.border = 'none';
+        closeBtn.style.borderRadius = '4px';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.style.float = 'right';
+        closeBtn.onclick = () => {
+            panel.style.display = 'none';
+        };
+        panel.appendChild(closeBtn);
+
+        document.body.appendChild(panel);
+        this.ui.settingsPanel = panel;
+    }
+
+    async initAudio() {
+        const audioLoader = new THREE.AudioLoader();
+        try {
+            // Load Music
+            audioLoader.load('assets/socarmusic.mp3', (buffer) => {
+                this.bgMusic.setBuffer(buffer);
+                this.bgMusic.setLoop(true);
+                this.bgMusic.setVolume(this.isMuted ? 0 : this.musicVolume); // Use stored
+            });
+            // Load Narration
+            audioLoader.load('assets/narration.mp3', (buffer) => {
+                this.narration.setBuffer(buffer);
+                this.narration.setLoop(false);
+                this.narration.setVolume(this.isMuted ? 0 : this.narrationVolume); // Use stored
+            });
+        } catch(e) { console.error("Failed to load audio", e); }
+    }
+
     async start() {
         if (this.isPlaying) return;
         this.isPlaying = true;
@@ -54,29 +391,44 @@ export class PresentationController {
         console.log("Starting Presentation...");
         if (this.ui.startOverlay) this.ui.startOverlay.style.display = 'none';
         
-        this.startSubtitleStream();
+        // this.startSubtitleStream(); // DISABLED: Using JSON-based subtitles in update()
+        this.narrationStartTime = this.audioContext.currentTime; // T=0 reference for sync
+
 
         try {
-            if (this.audioContext && this.audioContext.state === 'suspended') {
-                 this.audioContext.resume().catch(e => console.warn("Audio Resume Failed", e));
+            // Logic to handle "Double Click" issue:
+            // Ensure context is resumed.
+            if (this.audioContext.state === 'suspended') {
+                 await this.audioContext.resume();
             }
-            await this.initAudio();
+            
+            // Wait slightly for buffers if loop loaded fast? 
+            // setBuffer is synchronous once load finishes. 
+            // If user clicks FAST, buffer might be null.
+            // Check if buffer exists, if not wait?
+            if (!this.bgMusic.buffer || !this.narration.buffer) {
+                 console.log("Audio buffering...");
+                 // Simple wait loop (fallback)
+                 let attempts = 0;
+                 while((!this.bgMusic.buffer || !this.narration.buffer) && attempts < 20) {
+                     await new Promise(r => setTimeout(r, 200));
+                     attempts++;
+                 }
+            }
+            
+            if (this.bgMusic && this.bgMusic.buffer) {
+                 this.bgMusic.play();
+            }
+            
+            if (this.narration && this.narration.buffer) {
+                setTimeout(() => {
+                    if (this.isPlaying && this.narration.buffer) {
+                         this.narration.play();
+                    }
+                }, 8000); // reduced from 12000 to match new offset
+            }
         } catch (e) {
-            console.error("Audio Init Failed", e);
-        }
-        
-        if (this.bgMusic) {
-             this.bgMusic.play();
-             this.bgMusic.setVolume(this.isMuted ? 0 : 0.5);
-        }
-        
-        if (this.narration) {
-            setTimeout(() => {
-                if (this.isPlaying) {
-                     this.narration.play();
-                     this.narration.setVolume(this.isMuted ? 0 : 1.0);
-                }
-            }, 12000); 
+            console.error("Audio Start Failed", e);
         }
 
         await this.nextSlide();
@@ -128,13 +480,10 @@ export class PresentationController {
     }
 
     initDebugUI() {
-        // Removed Ladybird Icon as requested.
-        // Toggle via 'b' key only (handled in initControls).
-
-        // Debug Panel (Enhanced)
+        // Debug Panel
         const debugPanel = document.createElement('div');
         debugPanel.style.position = 'absolute';
-        debugPanel.style.top = '20px'; // Higher now
+        debugPanel.style.top = '20px'; 
         debugPanel.style.left = '50%';
         debugPanel.style.transform = 'translateX(-50%)';
         debugPanel.style.backgroundColor = 'rgba(0, 0, 0, 0.8)'; 
@@ -149,7 +498,7 @@ export class PresentationController {
         debugPanel.style.textAlign = 'left';
         debugPanel.style.minWidth = '300px'; 
         
-        // Add Animation Toggle inside Panel
+        // Add Animation Toggle
         const animToggle = document.createElement('div');
         animToggle.textContent = 'Toggle Animations';
         animToggle.style.cursor = 'pointer';
@@ -165,7 +514,6 @@ export class PresentationController {
         const debugContent = document.createElement('div');
         this.ui.debugContent = debugContent;
         debugPanel.appendChild(debugContent);
-
         document.body.appendChild(debugPanel);
         this.ui.debugPanel = debugPanel;
     }
@@ -199,11 +547,28 @@ export class PresentationController {
     }
 
     update(time) {
+        // --- 1. REVERT PREVIOUS HEAD TRACKING ---
+        // Undo Position
+        if (this.lastTrackingOffset) {
+            this.camera.position.sub(this.lastTrackingOffset);
+        }
+        // Undo Rotation (Critical for IJKL stability)
+        if (this.lastTrackingQuat) {
+             const inverse = this.lastTrackingQuat.clone().invert();
+             this.camera.quaternion.multiply(inverse);
+        }
+        // ----------------------------------------
+        
         const dt = 0.016; 
         const moveSpeed = this.keys && this.keys.shift ? 10.0 : 5.0; 
         const rotSpeed = 1.5;
         
-        // Manual
+        // Manual Controls
+        // If Q/E (Titan/Strafing) are pressed, force Manual Rotation to prevent LookAt fighting
+        if (this.keys.q || this.keys.e) {
+            this.manualRotation = true;
+        }
+
         if (this.keys.w) this.camera.translateZ(-moveSpeed * dt);
         if (this.keys.s) this.camera.translateZ(moveSpeed * dt);
         if (this.keys.a) this.camera.translateX(-moveSpeed * dt);
@@ -227,11 +592,9 @@ export class PresentationController {
         const slide = slides[this.currentSlideIndex];
         const elapsed = (time - this.slideStartTime) / 1000;
         
-        // 1. Asset Animation Logic
+        // Asset Animation
         if (this.currentObject && this.enableAssetAnim) {
-            // Apply Dolly
             this.currentObject.position.z += (0.05 * 0.016); 
-            
             if (slide.animation === 'scale_up') {
                 const duration = 12.0; 
                 const t = Math.min(elapsed / duration, 1.0);
@@ -241,7 +604,7 @@ export class PresentationController {
             }
         }
         
-        // 2. Camera Animation Logic
+        // Camera Animation (LookAt)
         if (this.isPlaying && !this.manualRotation && this.enableAssetAnim) {
             const freq = 0.2;
             const t = time * 0.001 * freq;
@@ -269,7 +632,7 @@ export class PresentationController {
             else if (slide.animation === 'zolly_in' || slide.animation === 'zolly_in_gentle' || slide.animation === 'zolly_in_fast') {
                 let speed = 0.3;
                 if (slide.animation === 'zolly_in_gentle') speed = 0.1;
-                if (slide.animation === 'zolly_in_fast') speed = 0.5; // Increased for 2billion
+                if (slide.animation === 'zolly_in_fast') speed = 0.5; 
                 this.camera.position.z -= speed * dt;
                  this.camera.lookAt(0, 1.75, -0.5);
             }
@@ -298,87 +661,197 @@ export class PresentationController {
             }
         }
         
-        // 2b. Additive Head Tracking with Smoothing & Counter-Rotation
-        if (!this.lastTrackingOffset) this.lastTrackingOffset = new THREE.Vector3();
-        // Remove old offset before calculating new one
-        this.camera.position.sub(this.lastTrackingOffset);
+        // --- 2. APPLY HEAD TRACKING ---
+        if (this.enableHeadTracking) {
+             const targetTrackingVector = new THREE.Vector3();
+             if (trackingState && trackingState.headPose && trackingState.headPose.faceLandmarks && trackingState.headPose.faceLandmarks.length > 0) {
+                 const face = trackingState.headPose.faceLandmarks[0];
+                 const nose = face[1]; 
+                 const dx = (nose.x - 0.5) * 2.0; 
+                 const dy = (nose.y - 0.5) * 2.0;
+                 
+                 const rangeX = 0.8; 
+                 const rangeY = 0.6; 
+                 targetTrackingVector.set(dx * rangeX, -dy * rangeY, 0);
+             }
+             
+             // Smooth dampening
+             const smoothFactor = 0.1; 
+             this.currentTrackingOffset.lerp(targetTrackingVector, smoothFactor);
+             
+             // A. Position Offset
+             // Must apply in Camera Local space (Quat) BUT we haven't applied rot offset yet.
+             // Apply based on PRESENTATION rotation.
+             const appliedOffset = this.currentTrackingOffset.clone();
+             appliedOffset.applyQuaternion(this.camera.quaternion); 
+             this.camera.position.add(appliedOffset);
+             this.lastTrackingOffset.copy(appliedOffset);
+             
+             // B. Rotation Offset (Counter-Rotate)
+             const rotX = this.currentTrackingOffset.y * -0.2; 
+             const rotY = this.currentTrackingOffset.x * 0.2; 
+             
+             // Create Quaternion for this frame's tracking rotation
+             const trackingQuat = new THREE.Quaternion();
+             // Euler order YX? 
+             const euler = new THREE.Euler(rotX, rotY, 0, 'YXZ');
+             trackingQuat.setFromEuler(euler);
+             
+             this.camera.quaternion.multiply(trackingQuat);
+             this.lastTrackingQuat.copy(trackingQuat);
+        } else {
+             // If disabled, reset trackers
+             this.lastTrackingOffset.set(0,0,0);
+             this.lastTrackingQuat.identity();
+             this.currentTrackingOffset.set(0,0,0);
+        }
+        // -----------------------------
         
-        const targetTrackingVector = new THREE.Vector3();
-        if (trackingState && trackingState.headPose && trackingState.headPose.faceLandmarks && trackingState.headPose.faceLandmarks.length > 0) {
-            const face = trackingState.headPose.faceLandmarks[0];
-            const nose = face[1]; 
-            const dx = (nose.x - 0.5) * 2.0; 
-            const dy = (nose.y - 0.5) * 2.0;
-            
-            // "make it look up and down more, moving camera slightly up and pointing it downwards"
-            // "or lowering it and pointing it upwards"
-            // If nose.y goes UP (negative dy?), camera goes UP, Rotation X goes DOWN (positive?)
-            
-            const rangeX = 0.8; 
-            const rangeY = 0.6; // Increased from 0.3
-            
-            targetTrackingVector.set(dx * rangeX, -dy * rangeY, 0);
-            
-            // We do NOT apply quaternion here immediately b/c we want to separate Position shift from Rotation shift?
-            // Actually, if we translate camera, we must ensure rotation compensates.
-            // Let's smooth the Vector first.
+        // 3. Timeline & Audio Sync
+        let currentAudioTime = 0;
+        if (this.narration && this.narration.isPlaying) {
+            // approximate
+            // ThreeJS audio doesn't expose extract current playback time easily if looped=false without some math 
+            // context.currentTime is global. 
+            // We need start time of the audio.
+            // Let's assume we handle 'audioStartTime' when we play.
         }
         
-        // Smooth dampening
-        const smoothFactor = 0.1; // Lower = smoother/slower
-        this.currentTrackingOffset.lerp(targetTrackingVector, smoothFactor);
+        // REVISED STRATEGY: 
+        // We use the `this.narration` object. 
+        // If playing, we calculate time.
+        // Actually, let's just use a main presentation timer that mirrors the audio.
+        // Or if audio is playing, use that.
         
-        // Apply Smoothed Position Offset
-        const appliedOffset = this.currentTrackingOffset.clone();
-        appliedOffset.applyQuaternion(this.camera.quaternion); // Align to camera space
-        this.camera.position.add(appliedOffset);
-        this.lastTrackingOffset.copy(appliedOffset);
+        let presentationTime = 0;
+        if (this.isPlaying && this.slideStartTime > 0) {
+             // We need a Global Time for the presentation, not just per slide.
+             // But existing logic is per slide.
+             // If we have proper startTimes, we should use Global Time.
+             
+             // Let's introduce `this.globalStartTime`.  
+             if (!this.globalStartTime) {
+                 // Init on first update after play?
+             }
+        }
         
-        // Apply Counter-Rotation based on offset
-        // If we move UP (+Y local), we want to look DOWN (-X local rotation).
-        // If we move RIGHT (+X local), we want to look LEFT (+Y or -Y local rotation?).
+        // BETTER: Use the Audio Context Time (if audio is running)
+        if (this.narration && this.isPlaying && this.narrationSource) {
+             // We need to capture the source node or track start time.
+             // ThreeJS Audio `play()` creates a source. `this.narration.source`.
+             // Time = context.currentTime - startTime + offset
+             // Accessing private/internal properties of Three Audio is risky.
+             
+             // ALTERNATIVE: Just trust the elapsed time deltas if we aren't pausing much.
+             // OR: Use the `narration.json` effectively.
+             
+             // Let's use a robust approach:
+             // Maintain `this.presentationTime` accumulator.
+             // Sync it to Audio if possible.
+        }
         
-        // Store original rotation to restore next frame? 
-        // Or just apply as additive to a 'base' rotation?
-        // Since camera logic above sets LookAt or rotation every frame, we can just add to it here.
-        // BUT lookingAt resets rotation. So we update rotation AFTER lookAt logic.
+        // SIMPLIFIED APPROACH:
+        // Since we are forcing the audio to start at specific times or continuous?
+        // Narration is ONE big file.
+        // So we just need to track "How long has narration been playing?"
         
-        const rotX = this.currentTrackingOffset.y * -0.2; // Move Up -> Rot Down
-        const rotY = this.currentTrackingOffset.x * 0.2; // Move Right -> Rot Left? (Check sign)
-        
-        this.camera.rotateX(rotX);
-        this.camera.rotateY(rotY);
-        
-        // 3. Timeline
-        if (this.ui.playhead && this.ui.timelineDots.length > 0) {
-             this.ui.timelineDots.forEach(dot => {
-                if (dot.index === this.currentSlideIndex) {
-                    dot.label.style.color = 'white';
-                    dot.label.style.transform = 'scale(1.3)';
-                    dot.label.style.fontWeight = 'bold';
-                } else {
-                    dot.label.style.color = 'rgba(255,255,255,0.5)';
-                    dot.label.style.transform = 'scale(1)';
-                    dot.label.style.fontWeight = '300';
-                }
-            });
+        if (this.isPlaying && this.narrationStartTime !== undefined) {
+             currentAudioTime = this.audioContext.currentTime - this.narrationStartTime;
+        } else if (this.currentSlideIndex >= 0) {
+             // Fallback if audio hasn't started yet (delay)
+             // currentAudioTime = 0; 
+        }
 
-            const progress = Math.min(elapsed / slide.duration, 1.0);
-            const segmentWidth = 100 / (this.ui.timelineDots.length - 1);
-            const currentPos = this.currentSlideIndex * segmentWidth;
-            let interpolated = currentPos;
-            if (this.currentSlideIndex < this.ui.timelineDots.length - 1) {
-                interpolated = currentPos + (progress * segmentWidth);
+        // DEBUG: Log timing every 100 frames (~1.6s)
+        if (this.isPlaying && this.renderer && this.renderer.info.render.frame % 100 === 0) {
+             console.log(`Time: ${currentAudioTime.toFixed(2)}s, Slide: ${this.currentSlideIndex}`);
+        }
+        
+        // Update Subtitles (Word-Level Glow)
+        this.updateSubtitles(currentAudioTime);
+
+        // Timeline visualization
+        const totalDuration = slides[slides.length-1].startTime + (slides[slides.length-1].duration || 10);
+        const globalProgress = Math.min(currentAudioTime / totalDuration, 1.0);
+        
+        // Update Playhead (Global)
+        if (this.ui.playhead) {
+            this.ui.playhead.style.left = `${globalProgress * 100}%`;
+        }
+
+        // Highlight Active Year
+        if (this.ui.timelineDots) {
+             this.ui.timelineDots.forEach(dot => {
+                const s = slides[dot.index];
+                if (currentAudioTime >= s.startTime && currentAudioTime < s.startTime + s.duration) {
+                     dot.label.style.color = 'white';
+                     dot.label.style.transform = 'scale(1.3)';
+                 } else {
+                     dot.label.style.color = 'rgba(255,255,255,0.5)';
+                     dot.label.style.transform = 'scale(1)';
+                 }
+             });
+        }
+        
+        // 4. Slide Transition Logic (Time-Based)
+        // Check if we reached the NEXT slide's start time
+        const nextIndex = this.currentSlideIndex + 1;
+        if (nextIndex < slides.length) {
+            const nextSlide = slides[nextIndex];
+            // If Text Match failed, nextSlide.startTime might be undefined/invalid.
+            // But we sorted, so it should be monotonically increasing.
+            // Threshold: 0.1s tolerance
+            if (nextSlide.startTime !== undefined && currentAudioTime >= nextSlide.startTime) {
+                 this.nextSlide();
             }
-            this.ui.playhead.style.left = `${interpolated}%`;
         }
+    }
+
+    updateSubtitles(time) {
+        if (!this.narrationData || !this.ui.subtitles) return;
         
-        // 4. Next Slide
-        if (elapsed > slide.duration) {
-            this.nextSlide();
+        // Find current segment
+        const segment = this.narrationData.segments.find(s => time >= s.start_time && time <= s.end_time);
+        
+        if (segment) {
+            // Find current word
+            const currentWord = segment.words ? segment.words.find(w => time >= w.start_time && time <= w.end_time) : null;
+            
+            let html = "";
+            if (segment.words) {
+                html = segment.words.map((w, idx) => {
+                    const isCurrent = (currentWord === w);
+                    
+                    // Style Logic:
+                    // Active: Slightly larger (1pt approx), subtle glow, minimal margin expansion
+                    
+                    const baseStyle = "transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275); display: inline-block; vertical-align: middle;";
+                    
+                    let specializedStyle = "color: rgba(255,255,255,0.6);";
+                    if (isCurrent) {
+                        specializedStyle = `
+                            text-shadow: 0 0 10px rgba(255, 255, 255, 0.4); 
+                            color: #ffffff; 
+                            font-size: 1.1em; 
+                            font-weight: 500;
+                            margin: 0 4px; 
+                            transform: scale(1.02);
+                        `;
+                    }
+                    
+                    return `<span style="${baseStyle} ${specializedStyle}">${w.text}</span>`;
+                }).join(' ');
+            } else {
+                html = segment.text; 
+            }
+            
+            if (this.ui.subtitles.innerHTML !== html) {
+                this.ui.subtitles.innerHTML = html;
+            }
+            this.ui.subtitles.style.opacity = '1';
+        } else {
+            this.ui.subtitles.style.opacity = '0'; // Hide if silence
         }
-        
-        this.updateDebug(slide, elapsed);
     }
     
     updateDebug(slide, elapsed) {
@@ -387,9 +860,6 @@ export class PresentationController {
         
         const cPos = this.camera.position;
         const cRot = this.camera.rotation;
-        const oPos = this.currentObject ? this.currentObject.position : {x:0, y:0, z:0};
-        const oRot = this.currentObject ? this.currentObject.rotation : {x:0, y:0, z:0};
-        const oScale = this.currentObject ? this.currentObject.scale : {x:0, y:0, z:0};
         
         const text = `
 === CAMERA ===
@@ -397,22 +867,72 @@ Pos:  ${cPos.x.toFixed(2)}, ${cPos.y.toFixed(2)}, ${cPos.z.toFixed(2)}
 Rot:  ${cRot.x.toFixed(2)}, ${cRot.y.toFixed(2)}, ${cRot.z.toFixed(2)}
 FOV:  ${this.camera.fov.toFixed(1)}
 
-=== OBJECT (${slide.type}) ===
-Pos:  ${oPos.x.toFixed(2)}, ${oPos.y.toFixed(2)}, ${oPos.z.toFixed(2)}
-Rot:  ${oRot.x.toFixed(2)}, ${oRot.y.toFixed(2)}, ${oRot.z.toFixed(2)}
-Scl:  ${oScale.x.toFixed(2)}, ${oScale.y.toFixed(2)}, ${oScale.z.toFixed(2)}
-
 Slide: ${this.currentSlideIndex} / ${slides.length}
 Name: ${slide.path}
 Anim: ${slide.animation || 'None'}
-Time: ${elapsed.toFixed(1)}s / ${slide.duration}s
+Tracking: ${this.enableHeadTracking ? 'ON' : 'OFF'}
 Manual: ${this.manualRotation}
-Anim Enabled: ${this.enableAssetAnim}
         `.trim();
         
         this.ui.debugContent.textContent = text;
     }
     
+    async loadAsset(index) {
+        if (index < 0 || index >= slides.length) return null;
+        const slide = slides[index];
+        
+        // Check Cache
+        if (this.assets[slide.path]) return this.assets[slide.path];
+        
+        console.log(`Loading asset: ${slide.path} (${slide.type})`);
+        
+        try {
+            if (slide.type === 'glb') {
+                const gltf = await this.loaders.gltf.loadAsync(`assets/${slide.path}`);
+                const model = gltf.scene;
+                this.assets[slide.path] = model;
+                return model;
+            } 
+            else if (slide.type === 'spz') {
+                try {
+                    const splat = await this.loaders.splat.loadAsync(`assets/${slide.path}`);
+                    const mesh = new SplatMesh({ packedSplats: splat }); // Use object signature like scene.js
+                    this.assets[slide.path] = mesh;
+                    // console.log(`[DEBUG] Loaded Splat: ${slide.path}. Mesh ID: ${mesh.id}`);
+                    return mesh;
+                } catch (err) {
+                    console.error(`[DEBUG] Failed to load splat ${slide.path}`, err);
+                    return null;
+                }
+            }
+            else if (slide.type === 'img') {
+                const tex = await this.loaders.texture.loadAsync(`assets/${slide.path}`);
+                const geometry = new THREE.PlaneGeometry(1.6 * 2, 0.9 * 2); // 16:9 Aspect
+                const material = new THREE.MeshBasicMaterial({ 
+                    map: tex, 
+                    transparent: true,
+                    side: THREE.DoubleSide
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                this.assets[slide.path] = mesh;
+                return mesh;
+            }
+        } catch(e) {
+            console.error(`Failed to load asset ${slide.path}`, e);
+            return null;
+        }
+    }
+
+    async jumpToSlide(index) {
+        // Reset state
+        if (this.currentObject) {
+            this.scene.remove(this.currentObject);
+            this.currentObject = null;
+        }
+        this.currentSlideIndex = index - 1; // nextSlide will increment
+        await this.nextSlide();
+    }
+
     async nextSlide() {
         if (this.isTransitioning) return;
         this.isTransitioning = true;
@@ -442,6 +962,10 @@ Anim Enabled: ${this.enableAssetAnim}
         this.camera.position.set(0, 1.6, 5);
         this.camera.rotation.set(0, 0, 0);
         this.manualRotation = false; 
+        
+        // Reset tracking history too to prevent jumps
+        this.lastTrackingOffset.set(0,0,0);
+        this.lastTrackingQuat.identity();
         // -----------------------------------
 
         this.currentSlideIndex = index;
@@ -486,6 +1010,31 @@ Anim Enabled: ${this.enableAssetAnim}
     }
     
     initUI() {
+        // Toggle Icon (Top Center)
+        const toggleEl = document.createElement('div');
+        toggleEl.style.position = 'absolute';
+        toggleEl.style.top = '20px';
+        toggleEl.style.left = '50%';
+        toggleEl.style.transform = 'translateX(-50%)';
+        toggleEl.style.width = '30px'; 
+        toggleEl.style.height = '30px';
+        toggleEl.style.cursor = 'pointer';
+        toggleEl.style.zIndex = '1001';
+        toggleEl.title = "Toggle Head Tracking";
+        
+        const eyeSvg = `<svg viewBox="0 0 24 24" fill="white"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>`;
+        const eyeOffSvg = `<svg viewBox="0 0 24 24" fill="gray"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-4 .7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>`;
+        
+        toggleEl.innerHTML = eyeSvg;
+        toggleEl.onclick = () => {
+            this.enableHeadTracking = !this.enableHeadTracking;
+            toggleEl.innerHTML = this.enableHeadTracking ? eyeSvg : eyeOffSvg;
+            toggleEl.querySelector('svg').style.fill = this.enableHeadTracking ? 'white' : 'gray';
+        };
+        
+        document.body.appendChild(toggleEl);
+        this.ui.trackingToggle = toggleEl;
+        
         // Simple Fade Overlay
         const fadeEl = document.createElement('div');
         fadeEl.style.position = 'absolute';
@@ -501,36 +1050,13 @@ Anim Enabled: ${this.enableAssetAnim}
         document.body.appendChild(fadeEl);
         this.ui.fade = fadeEl;
         
-        // Start Button Overlay
-        const startOverlay = document.createElement('div');
-        startOverlay.style.position = 'absolute';
-        startOverlay.style.top = '0';
-        startOverlay.style.left = '0';
-        startOverlay.style.width = '100%';
-        startOverlay.style.height = '100%';
-        startOverlay.style.backgroundColor = 'rgba(0,0,0,0.7)';
-        startOverlay.style.display = 'flex';
-        startOverlay.style.justifyContent = 'center';
-        startOverlay.style.alignItems = 'center';
-        startOverlay.style.zIndex = '2000';
-        
-        const startBtn = document.createElement('button');
-        startBtn.textContent = 'START SOÇAR 1972';
-        startBtn.style.padding = '20px 40px';
-        startBtn.style.fontSize = '24px';
-        startBtn.style.fontFamily = '"Helvetica Neue", sans-serif';
-        startBtn.style.fontWeight = '300';
-        startBtn.style.letterSpacing = '2px';
-        startBtn.style.color = 'white';
-        startBtn.style.background = 'transparent';
-        startBtn.style.border = '1px solid white';
-        startBtn.style.cursor = 'pointer';
-        startBtn.style.textTransform = 'uppercase';
-        startBtn.onclick = () => this.start();
-        
-        startOverlay.appendChild(startBtn);
-        document.body.appendChild(startOverlay);
-        this.ui.startOverlay = startOverlay;
+        /* 
+    // Start Button Overlay REMOVED - Managed by main.js / index.html
+    const startOverlay = document.createElement('div');
+    // ...
+    this.ui.startOverlay = startOverlay;
+    */
+
         
         // Subtitles (Updated Style: Bigger, Heavier -> REDUCED WEIGHT to 400)
         const subEl = document.createElement('div');
@@ -679,8 +1205,8 @@ Anim Enabled: ${this.enableAssetAnim}
 
     toggleMute() {
         this.isMuted = !this.isMuted;
-        if (this.bgMusic) this.bgMusic.setVolume(this.isMuted ? 0 : 0.3);
-        if (this.narration) this.narration.setVolume(this.isMuted ? 0 : 1.0);
+        if (this.bgMusic) this.bgMusic.setVolume(this.isMuted ? 0 : this.musicVolume);
+        if (this.narration) this.narration.setVolume(this.isMuted ? 0 : this.narrationVolume);
         this.updateMuteIcon();
     }
 
@@ -699,73 +1225,5 @@ Anim Enabled: ${this.enableAssetAnim}
              if (this.bgMusic) this.bgMusic.setVolume(0); 
              if (this.narration) this.narration.setVolume(0);
         }
-    }
-
-    async initAudio() {
-        const audioLoader = new THREE.AudioLoader();
-        
-        this.bgMusic = new THREE.Audio(this.listener);
-        try {
-            const buffer = await audioLoader.loadAsync('assets/socarmusic.mp3');
-            this.bgMusic.setBuffer(buffer);
-            this.bgMusic.setLoop(true);
-            this.bgMusic.setVolume(this.isMuted ? 0 : 0.3); 
-        } catch(e) { console.error("Failed to load music", e); }
-        
-        this.narration = new THREE.Audio(this.listener);
-        try {
-            const buffer = await audioLoader.loadAsync('assets/narration.mp3');
-            this.narration.setBuffer(buffer);
-            this.narration.setLoop(false);
-            this.narration.setVolume(this.isMuted ? 0 : 1.0);
-        } catch(e) { console.error("Failed to load narration", e); }
-    }
-    
-    async loadAsset(index) {
-        if (this.assets[index]) return this.assets[index];
-        if (index >= slides.length) return null; 
-
-        const slide = slides[index];
-        const url = `assets/${slide.path}`;
-        let object = null;
-        
-        try {
-            if (slide.type === 'glb') {
-                const gltf = await this.loaders.gltf.loadAsync(url);
-                object = gltf.scene;
-            } else if (slide.type === 'spz') {
-                const buffer = await this.loaders.splat.loadAsync(url);
-                object = new SplatMesh({ packedSplats: buffer });
-            } else if (slide.type === 'img') {
-                const tex = await this.loaders.texture.loadAsync(url);
-                tex.colorSpace = THREE.SRGBColorSpace;
-                
-                // Fix aspect ratio
-                const aspect = tex.image.width / tex.image.height;
-                const height = 2.0; // Base height
-                const width = height * aspect;
-                
-                const geo = new THREE.PlaneGeometry(width, height); 
-                const mat = new THREE.MeshBasicMaterial({ 
-                    map: tex, 
-                    transparent: true,
-                    side: THREE.DoubleSide
-                });
-                object = new THREE.Mesh(geo, mat);
-            }
-            
-            if (object) {
-                if (slide.transform) {
-                    object.position.set(...slide.transform.position);
-                    object.scale.set(...slide.transform.scale);
-                    object.rotation.set(...slide.transform.rotation);
-                }
-                this.assets[index] = object;
-            }
-        } catch(e) {
-            console.error(`Failed to load asset ${slide.path}`, e);
-        }
-        
-        return object;
     }
 }
