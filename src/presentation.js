@@ -67,8 +67,11 @@ export class PresentationController {
         }
     }
 
-    syncSlides() {
+    async syncSlides() {
         if (!this.narrationData) return;
+        
+        console.log("Syncing slides with narration...");
+        const segments = this.narrationData.segments;
         
         const normalize = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, '');
         const allWords = [];
@@ -80,8 +83,8 @@ export class PresentationController {
         console.log(`Syncing ${slides.length} slides against ${allWords.length} words...`);
 
         // OFFSET CORRECTION: The audio file has a ~12s silence/intro.
-        // We offset all narration data by 8s so that the 4s mark in audio aligns with T=12.
-        const offset = 8.0;
+        // We offset all narration data by 12s so that the start aligns with Intro end.
+        const offset = 12.0;
         this.narrationData.segments.forEach(seg => {
              if (seg.start_time) seg.start_time += offset;
              if (seg.end_time) seg.end_time += offset;
@@ -150,69 +153,75 @@ export class PresentationController {
         // We need to REBUILD specific UI parts that depend on slide order.
         // ---------------------------------------------------------
         // Refresh Timeline UI if it exists
-        if (this.ui.timelineDots) {
-            // Re-render timeline (simplified: just reload UI or update dots? 
-            // Better to re-init timeline dots in update if changed, 
-            // or just clear and rebuild here if UI is ready.
-            // Let's modify initUI to be callable or just update positions.
-            // For now, let's rely on the fact that initUI runs ONCE. 
-            // If we sort slides, we need to rebuild the timeline.
-            const timelineEl = this.ui.timelineDots[0]?.parentNode; // HACK to get parent
-            if (timelineEl) {
-                // Clear dots
-                this.ui.timelineDots.forEach(d => timelineEl.removeChild(d.container));
-                this.ui.timelineDots = [];
-                
-                // Rebuild
-                const yearSlides = slides.filter(s => s.year);
-                const segmentWidth = 100 / (yearSlides.length - 1);
-                let visualIdx = 0;
-                
-                slides.forEach((slide, idx) => {
-                    if (!slide.year) return; 
-                    const container = document.createElement('div');
-                    container.style.position = 'absolute';
-                    container.style.left = `${visualIdx * segmentWidth}%`;
-                    container.style.transform = 'translateX(-50%)';
-                    container.style.display = 'flex';
-                    container.style.flexDirection = 'column';
-                    container.style.alignItems = 'center';
-                    container.style.cursor = 'pointer';
-                    
-                    const tick = document.createElement('div');
-                    tick.style.width = '2px';
-                    tick.style.height = '10px';
-                    tick.style.backgroundColor = 'white';
-                    tick.style.marginBottom = '5px';
-                    container.appendChild(tick);
-                    
-                    const label = document.createElement('div');
-                    label.innerText = slide.year;
-                    label.style.color = 'rgba(255,255,255,0.7)';
-                    label.style.fontSize = '12px';
-                    label.style.fontFamily = 'monospace';
-                    label.style.transition = 'transform 0.3s, color 0.3s';
-                    container.appendChild(label);
-                    
-                    container.onclick = () => {
-                         // Seek logic needs update for Audio Time
-                         if (this.narration && slide.startTime !== undefined) {
-                             this.narration.stop();
-                             this.narration.offset = slide.startTime;
-                             this.narration.play();
-                             
-                             // Also need to sync music? No, loop is independent.
-                             
-                             // Force Slide Jump
-                             this.jumpToSlide(idx); 
-                         }
-                    };
-                    
-                    timelineEl.appendChild(container); // Add back to parent
-                    this.ui.timelineDots.push({ index: idx, label, container });
-                    visualIdx++;
+        if (this.ui.timeline) {
+            
+            // Clear existing dots
+            if (this.ui.timelineDots) {
+                this.ui.timelineDots.forEach(d => {
+                    if (d.container && d.container.parentNode) {
+                        d.container.parentNode.removeChild(d.container);
+                    }
                 });
             }
+            this.ui.timelineDots = [];
+            
+            // Rebuild
+            const timelineEl = this.ui.timeline;
+            const yearSlides = slides.filter(s => s.year);
+            const segmentWidth = 100 / (yearSlides.length - 1);
+            let visualIdx = 0;
+            
+            slides.forEach((slide, idx) => {
+                if (!slide.year) return; 
+                
+                const container = document.createElement('div');
+                container.style.position = 'absolute';
+                container.style.left = `${visualIdx * segmentWidth}%`;
+                container.style.transform = 'translateX(-50%)';
+                container.style.display = 'flex';
+                container.style.flexDirection = 'column';
+                container.style.alignItems = 'center';
+                container.style.cursor = 'pointer';
+                container.style.zIndex = '2005'; 
+                container.style.padding = '10px 5px';
+                container.style.pointerEvents = 'auto';
+                
+                const tick = document.createElement('div');
+                tick.style.width = '2px';
+                tick.style.height = '10px';
+                tick.style.backgroundColor = 'white';
+                tick.style.marginBottom = '5px';
+                container.appendChild(tick);
+                
+                const label = document.createElement('div');
+                label.innerText = slide.year;
+                label.style.color = 'rgba(255,255,255,0.7)';
+                label.style.fontFamily = '"Helvetica Neue", sans-serif';
+                label.style.fontSize = '16px'; 
+                label.style.fontWeight = '500';
+                label.style.whiteSpace = 'nowrap';
+                label.style.transition = 'color 0.3s, transform 0.3s';
+                container.appendChild(label);
+                
+                container.onclick = () => {
+                   if (this.narration && slide.startTime !== undefined) {
+                       this.narration.stop();
+                       this.narration.offset = slide.startTime;
+                       this.narration.play();
+                   }
+                   this.jumpToSlide(idx);
+                };
+                
+                timelineEl.appendChild(container);
+                
+                this.ui.timelineDots.push({
+                    index: idx,
+                    label: label,
+                    container: container,
+                    leftPercent: visualIdx * segmentWidth
+                });
+                visualIdx++;
+            });
         }
     }
 
@@ -388,11 +397,14 @@ export class PresentationController {
         if (this.isPlaying) return;
         this.isPlaying = true;
         
-        console.log("Starting Presentation...");
+        console.log("Starting Presentation... CTX State:", this.audioContext.state);
         if (this.ui.startOverlay) this.ui.startOverlay.style.display = 'none';
         
         // this.startSubtitleStream(); // DISABLED: Using JSON-based subtitles in update()
-        this.narrationStartTime = this.audioContext.currentTime; // T=0 reference for sync
+        
+        await this.audioContext.resume();
+        this.narrationStartTime = this.audioContext.currentTime; 
+        console.log(`Narration Start Time set to: ${this.narrationStartTime}`);
 
 
         try {
@@ -425,7 +437,7 @@ export class PresentationController {
                     if (this.isPlaying && this.narration.buffer) {
                          this.narration.play();
                     }
-                }, 8000); // reduced from 12000 to match new offset
+                }, 12000); // 12s delay for Intro
             }
         } catch (e) {
             console.error("Audio Start Failed", e);
@@ -606,16 +618,40 @@ export class PresentationController {
         
         // Camera Animation (LookAt)
         if (this.isPlaying && !this.manualRotation && this.enableAssetAnim) {
-            const freq = 0.2;
+            const freq = 0.1 * 0.85; // Reduced 50% (was 0.2)
             const t = time * 0.001 * freq;
             
+            const speedScale = slide.speedScale || 1.0;
+            const globalSpeed = 0.85; // Stretch animation to match 15% longer duration
+            
             if (slide.animation === 'strafe_down') {
-                const speed = 0.2;
+                const speed = 0.2 * speedScale * globalSpeed;
                 this.camera.position.y -= speed * dt;
                 this.camera.lookAt(0, 1.75, -0.5); 
             } 
+            else if (slide.animation === 'strafe_down_pitch') {
+                const speed = 0.266 * speedScale * globalSpeed; 
+                this.camera.position.y -= speed * dt;
+                
+                // Slowly look up (increase parallax) - Reduced tilt significantly
+                const lookUpOffset = elapsed * 0.02; 
+                this.camera.lookAt(0, 1.75 + lookUpOffset, -0.5);
+            } 
+            else if (slide.animation === 'zolly_in_strafe') {
+                 // Reduced zoom speed + Slight right strafe
+                 let speed = 0.15; // Half of normal 0.3
+                 speed *= speedScale * globalSpeed;
+                 this.camera.position.z -= speed * dt;
+                 this.camera.position.x += 0.1 * speed * dt; // Slight right
+                 this.camera.lookAt(0, 1.75, -0.5);
+            }
+            else if (slide.animation === 'orbit_right') {
+                 const speed = 0.3 * speedScale * globalSpeed;
+                 this.camera.position.x += speed * dt; // Move camera right -> Orbits around looked-at point
+                 this.camera.lookAt(0, 1.75, -0.5);
+            } 
             else if (slide.animation === 'strafe_up') {
-                 const speed = 0.2;
+                 const speed = 0.2 * speedScale * globalSpeed;
                  this.camera.position.y += speed * dt;
                  this.camera.lookAt(0, 1.75, -0.5);
             }
@@ -633,11 +669,12 @@ export class PresentationController {
                 let speed = 0.3;
                 if (slide.animation === 'zolly_in_gentle') speed = 0.1;
                 if (slide.animation === 'zolly_in_fast') speed = 0.5; 
+                speed *= speedScale * globalSpeed; 
                 this.camera.position.z -= speed * dt;
                  this.camera.lookAt(0, 1.75, -0.5);
             }
             else if (slide.animation === 'zolly_out') {
-                const speed = 0.3;
+                const speed = 0.3 * speedScale * globalSpeed;
                 this.camera.position.z += speed * dt;
                  this.camera.lookAt(0, 1.75, -0.5);
             }
@@ -755,11 +792,22 @@ export class PresentationController {
         // Narration is ONE big file.
         // So we just need to track "How long has narration been playing?"
         
-        if (this.isPlaying && this.narrationStartTime !== undefined) {
-             currentAudioTime = this.audioContext.currentTime - this.narrationStartTime;
-        } else if (this.currentSlideIndex >= 0) {
-             // Fallback if audio hasn't started yet (delay)
-             // currentAudioTime = 0; 
+        if (this.isPlaying) {
+             if (this.narrationStartTime !== undefined) {
+                 // Calculate time based on Audio Context (most accurate for sync)
+                 currentAudioTime = this.audioContext.currentTime - this.narrationStartTime;
+                 
+                 // CORRECTION: Narration start offset
+                 // We delay narration by 8s (see start method). 
+                 // But slides are synced to 8s offset.
+                 // So if T=0 is when we clicked start, and Audio starts at T=8...
+                 // The narration.json times are shifted by +8.
+                 // So `currentTime` should be relative to "Start Click".
+                 // YES. `narrationStartTime` is set at `start()`.
+             } else {
+                 // Fallback: Use simple elapsed time if audio context is weird
+                 currentAudioTime = time * 0.001; 
+             }
         }
 
         // DEBUG: Log timing every 100 frames (~1.6s)
@@ -832,10 +880,8 @@ export class PresentationController {
                         specializedStyle = `
                             text-shadow: 0 0 10px rgba(0,0,0,0.8), 0 0 20px rgba(0,0,0,0.6), 0 0 5px rgba(255,255,255,0.8);
                             color: #ffffff; 
-                            font-size: 1.1em; 
                             font-weight: 600;
                             margin: 0 4px; 
-                            transform: scale(1.05);
                         `;
                     }
                     
@@ -946,10 +992,43 @@ Manual: ${this.manualRotation}
         await new Promise(r => setTimeout(r, 2500)); 
         
         // 2. Remove Old Asset
+        // Cleanup previous
         if (this.currentObject) {
+            console.log("Disposing previous asset:", this.currentObject);
             this.scene.remove(this.currentObject);
-             if (this.currentObject.dispose) this.currentObject.dispose();
-             this.currentObject = null; 
+            
+            // Extra cleanup for Overlay issues: Remove ANY Mesh/Points that isn't currentObject (if any left)
+            // This ensures Maps don't linger over SPZs or vice versa
+            this.scene.children.forEach(child => {
+                if ((child.isMesh || child.isPoints) && child !== this.currentObject) {
+                    // Ignore things like UI/Helpers if they are meshes? 
+                    // Assuming scene only has Assets + Lights.
+                    // But be careful of debug panel? (It's DOM usually).
+                    // Just removing from scene.
+                    this.scene.remove(child);
+                }
+            });
+            
+            // Deep dispose
+            this.currentObject.traverse((params) => {
+                if (params.isMesh) {
+                     if (params.geometry) params.geometry.dispose();
+                     if (params.material) {
+                         if (Array.isArray(params.material)) {
+                             params.material.forEach(m => m.dispose());
+                         } else {
+                             params.material.dispose();
+                         }
+                     }
+                }
+            });
+            // Specific dispose for custom objects like SplatMesh if they have one
+            if (this.currentObject.dispose) {
+                this.currentObject.dispose();
+            }
+            this.currentObject = null;
+        } else {
+            console.log("No previous asset to dispose.");
         }
         
         if (index >= slides.length) {
@@ -1129,6 +1208,9 @@ Manual: ${this.manualRotation}
             container.style.flexDirection = 'column';
             container.style.alignItems = 'center';
             container.style.cursor = 'pointer';
+            container.style.zIndex = '2005'; // Higher Z-Index
+            container.style.padding = '10px 5px'; // Increase hit area
+            container.style.pointerEvents = 'auto'; // Ensure clickable
             
             const tick = document.createElement('div');
             tick.style.width = '2px';
